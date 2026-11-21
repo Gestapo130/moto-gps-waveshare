@@ -1,0 +1,160 @@
+name: MotoNav original 1.75C firmware
+
+on:
+  push:
+    paths: ['.github/workflows/motonav-original-firmware.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  motonav-firmware-1-75c:
+    name: MotoNav 1.75C firmware (original UI and protocol)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      MOTONAV_SOURCE_SHA: 3b93facfd244b0477950189b6e26aa913b2ded78
+    steps:
+      - name: Preserve the reviewed upstream file bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Check out the fixed upstream source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: CharlesXu/MotoNav
+          ref: 3b93facfd244b0477950189b6e26aa913b2ded78
+          path: upstream
+          persist-credentials: false
+
+      - name: Install the official Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: 1.3.1
+
+      - name: Install the upstream ESP32 core version
+        run: |
+          $ErrorActionPreference = 'Stop'
+          arduino-cli version
+          if ($LASTEXITCODE -ne 0) { throw 'Arduino CLI is unavailable.' }
+          arduino-cli config init --overwrite
+          if ($LASTEXITCODE -ne 0) { throw 'Arduino CLI config failed.' }
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          if ($LASTEXITCODE -ne 0) { throw 'ESP32 index configuration failed.' }
+          arduino-cli core update-index
+          if ($LASTEXITCODE -ne 0) { throw 'ESP32 index download failed.' }
+          arduino-cli core install esp32:esp32@3.3.10
+          if ($LASTEXITCODE -ne 0) { throw 'ESP32 core installation failed.' }
+          arduino-cli core list
+
+      - name: Adapt only the two 1.75C reset pins
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force delivery | Out-Null
+          $actualCommit = (& git -C upstream rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $env:MOTONAV_SOURCE_SHA) { throw 'Unexpected upstream revision.' }
+          $buildHash = (Get-FileHash upstream/firmware/build.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($buildHash -ne '8c546c5e303b573a551572641d9e5afc2ab8ec9e1c4ae709cd15e5e3400d402a') { throw 'Upstream build script differs from the reviewed script.' }
+          $pinPath = Join-Path $PWD 'upstream/firmware/boards/175/MotoNav/pin_config.h'
+          $text = [IO.File]::ReadAllText($pinPath)
+          $lcdPattern = '(?m)^(#define LCD_RESET )39(?=\r?$)'
+          $touchPattern = '(?m)^(#define TP_RESET )40(?=\r?$)'
+          if ([regex]::Matches($text, $lcdPattern).Count -ne 1 -or [regex]::Matches($text, $touchPattern).Count -ne 1) { throw 'Expected original reset definitions are missing or duplicated.' }
+          $text = [regex]::Replace($text, $lcdPattern, '${1}1')
+          $text = [regex]::Replace($text, $touchPattern, '${1}2')
+          [IO.File]::WriteAllText($pinPath, $text, [Text.UTF8Encoding]::new($false))
+          & git -C upstream diff --no-ext-diff -- firmware/boards/175/MotoNav/pin_config.h | Set-Content delivery/board-1.75c.patch -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Could not record the board patch.' }
+          $changedFiles = @(& git -C upstream diff --name-only)
+          if ($changedFiles.Count -ne 1 -or $changedFiles[0] -ne 'firmware/boards/175/MotoNav/pin_config.h') { throw 'Unexpected source modifications.' }
+          Get-Content delivery/board-1.75c.patch
+
+      - name: Build using the reviewed original build script
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cliPath = (Get-Command arduino-cli).Source
+          & ./upstream/firmware/build.ps1 -Board 175 -PanelVariant 0 -CliPath $cliPath -Jobs 4 *>&1 | Tee-Object -FilePath delivery/build.log
+          if ($LASTEXITCODE -ne 0) { throw 'Firmware build failed.' }
+
+      - name: Verify and package the complete and application images
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = Join-Path $PWD 'upstream/firmware/dist/175/panel0'
+          $apps = @(Get-ChildItem -LiteralPath $dist -Filter '*_app_0x10000.bin' -File)
+          $fulls = @(Get-ChildItem -LiteralPath $dist -Filter '*_full_0x0.bin' -File)
+          if ($apps.Count -ne 1 -or $fulls.Count -ne 1) { throw 'Expected exactly one app and one full image.' }
+          $app = [IO.File]::ReadAllBytes($apps[0].FullName)
+          $full = [IO.File]::ReadAllBytes($fulls[0].FullName)
+          if ($app.Length -gt 3 * 1024 * 1024) { throw 'Application does not fit the original 3 MiB partition.' }
+          if ($full.Length -ne 0x10000 + $app.Length) { throw 'Unexpected full-image length.' }
+          $segment = [byte[]]::new($app.Length)
+          [Array]::Copy($full, 0x10000, $segment, 0, $app.Length)
+          $hasher = [Security.Cryptography.SHA256]::Create()
+          try {
+            if ([Convert]::ToBase64String($hasher.ComputeHash($segment)) -ne [Convert]::ToBase64String($hasher.ComputeHash($app))) { throw 'Full-image app segment differs from app image.' }
+          } finally { $hasher.Dispose() }
+          Copy-Item -LiteralPath $apps[0].FullName -Destination delivery/MotoNav_1.75C_v7.8.11_app_0x10000.bin
+          Copy-Item -LiteralPath $fulls[0].FullName -Destination delivery/MotoNav_1.75C_v7.8.11_full_0x0.bin
+          Copy-Item upstream/firmware/.build/175/output/MotoNav.ino.partitions.bin delivery/partitions.bin
+          Copy-Item upstream/firmware/boards/175/MotoNav/pin_config.h delivery/pin_config.h
+          Copy-Item upstream/LICENSE.md delivery/LICENSE-upstream.md
+          @{
+            repository = 'https://github.com/CharlesXu/MotoNav'
+            commit = $env:MOTONAV_SOURCE_SHA
+            firmware_version = '7.8.11'
+            target = 'Waveshare ESP32-S3-Touch-AMOLED-1.75C'
+            source_changes = @('LCD_RESET: GPIO39 -> GPIO1', 'TP_RESET: GPIO40 -> GPIO2')
+            esp32_arduino_core = '3.3.10'
+            arduino_cli = '1.3.1'
+            fqbn = 'esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,CDCOnBoot=cdc'
+            physical_flash_mib = 32
+            configured_flash_mib = 16
+            full_image_offset = '0x0'
+            app_image_offset = '0x10000'
+            app_bytes = $app.Length
+            full_bytes = $full.Length
+            ui_and_protocol = 'Original MotoNav; no Glimpse code or protocol changes.'
+            mobile_support = 'Upstream companion is Android; existing MOTO GPS iPhone app is not compatible.'
+          } | ConvertTo-Json -Depth 5 | Set-Content delivery/provenance.json -Encoding utf8
+          @'
+          MotoNav original firmware adapted to Waveshare ESP32-S3-Touch-AMOLED-1.75C.
+          Upstream commit: 3b93facfd244b0477950189b6e26aa913b2ded78 (firmware 7.8.11).
+          Only source changes: LCD_RESET GPIO39 -> GPIO1; TP_RESET GPIO40 -> GPIO2.
+          Original UI, BLE protocol, and 16 MiB / 3 MiB-app partition scheme retained.
+          A 16 MiB firmware layout is usable on the 32 MiB device; the upper half is unused.
+          FIRST INSTALL from Glimpse: back up the device and flash full_0x0 at 0x0.
+          APP-ONLY image at 0x10000 is for an existing matching MotoNav partition layout.
+          Upstream mobile companion supports Android. The existing MOTO GPS iPhone app
+          does not provide MotoNav navigation data. This build does not add iOS support.
+          Build success and image verification do not imply a completed hardware test.
+          Upstream non-commercial license and third-party licenses remain applicable.
+          '@ | Set-Content delivery/README.txt -Encoding utf8
+          Get-ChildItem delivery -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          } | Set-Content delivery/SHA256SUMS.txt -Encoding ascii
+          Get-Content delivery/provenance.json
+          Get-Content delivery/SHA256SUMS.txt
+
+      - name: Upload firmware, board patch, and provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: motonav-1.75c-v7.8.11
+          path: delivery/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the build log after a failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: motonav-1.75c-build-diagnostics
+          path: delivery/
+          if-no-files-found: ignore
+          retention-days: 7
